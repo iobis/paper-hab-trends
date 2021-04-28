@@ -1,0 +1,135 @@
+---
+title: Phytoplankton sampling effort based on OBIS data
+date: "`r Sys.Date()`"
+author: Pieter Provoost
+output: (function(...) {
+  rmdformats::robobook(toc_depth = 4, pandoc_args = c("+RTS", "-K2000m", "-RTS"), ...) })
+editor_options: 
+  chunk_output_type: console
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "docs") })  
+---
+
+This notebook calculates phytoplankton sampling effort over time for the IOC-UNESCO HAB regions as defined [here](https://github.com/iobis/hab-regions).
+
+## Download data
+### Phytoplankton occurrences
+
+First download all phytoplankton occurrences from OBIS using the `robis` package:
+
+```{r message=FALSE, warning=FALSE}
+library(robis)
+library(dplyr)
+
+if (!file.exists("occurrence.rds")) {
+  occ <- occurrence(taxonid = c(17329, 7, 146537), fields = c("decimalLongitude", "decimalLatitude", "date_mid"))
+  occ <- occ %>% select(-id)
+  saveRDS(occ, file = "occurrence.rds")
+} else {
+  occ <- readRDS("occurrence.rds")
+}
+```
+
+### HAB regions shapefile
+
+A shapefile for the HAB regions is available from https://github.com/iobis/hab-regions. 
+
+```{r message=FALSE, warning=FALSE}
+library(sf)
+
+if (!file.exists("hab-regions-master")) {
+  temp <- tempfile()
+  download.file("https://github.com/iobis/hab-regions/archive/refs/heads/master.zip", temp)
+  unzip(temp)
+  unlink(temp)
+}
+
+regions <- read_sf("hab-regions-master/hab_regions/hab_regions.shp", "hab_regions")
+```
+
+## Analysis
+
+First calculate years and months, and join the occurrence and HAB region tables:
+
+```{r message=FALSE, warning=FALSE}
+library(lubridate)
+
+occ_sf <- occ %>%
+  mutate(date = as.POSIXct(date_mid / 1000, origin = "1970-01-01")) %>%
+  mutate(year = year(date), month = month(date)) %>%
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326, remove = FALSE) %>%
+  st_join(regions, join = st_intersects)
+```
+
+Construct a discrete global grid using the [dggridR](https://github.com/r-barnes/dggridR) package (ISEA resolution 7) and assign cells to the occurrences:
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+library(dggridR)
+
+dggs <- dgconstruct(projection = "ISEA", res = 8)
+occ_sf$cell <- dgtransform(dggs, occ_sf$decimalLatitude, occ_sf$decimalLongitude)
+
+dginfo(dggs)
+```
+
+This is a visualization of the grid cells with observations in the European region.
+
+```{r message=FALSE, warning=FALSE, fig.height = 7}
+library(rmapshaper)
+
+eur <- regions %>%
+  filter(hab_region == 12) %>%
+  ms_dissolve() %>%
+  ms_simplify()
+
+cells <- occ_sf %>%
+  as.data.frame() %>%
+  filter(hab_region == 12 & year == 2010) %>%
+  group_by(year, month, cell) %>%
+  summarize()
+
+grid <- dgcellstogrid(dggs, cells$cell) %>%
+  mutate(cell = as.numeric(cell))
+
+cells <- cells %>%
+  left_join(grid, on = "cell")
+
+ggplot() +
+  geom_sf(data = eur, color = NA, fill = "#bbbbbb") +
+  geom_polygon(data = cells, aes(long, lat, group = group), fill = NA, color = "#cc3300") +
+  theme(
+    panel.background = element_blank(),
+    axis.line = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  ) +
+  facet_wrap(~paste0(year, "-", sprintf("%02d", month)), ncol = 4)
+```
+
+Calculate effort per region and year by counting the number of cell months. The results are written to `effort.csv`.
+
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+
+region_names <- c("ECA", "CCA", "SAM", "WCA", "ANZ", "SEA", "NAS", "Indian Ocean", "Benguela", "West Africa", "MED", "EUR", "PAC")
+
+stats <- occ_sf %>%
+  as.data.frame() %>%
+  select(year, month, hab_region, cell) %>%
+  filter(!is.na(hab_region)) %>%
+  mutate(hab_region = region_names[hab_region]) %>%
+  distinct(year, month, hab_region, cell) %>%
+  group_by(hab_region, year) %>%
+  summarize(effort = n())
+
+write.csv(stats, file = "effort.csv", row.names = FALSE)
+
+ggplot() +
+  geom_line(data = stats, aes(x = year, y = effort)) +
+  facet_wrap(~hab_region, scales = "free") +
+  xlim(c(1985, 2017))
+```
+
